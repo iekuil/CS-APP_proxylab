@@ -12,6 +12,7 @@ void client_error(int fd, char *cause, char *errnum, char *shortmsg, char *longm
 int parse_url(char *url, char *port, char *servername, char *filename);
 int forward_request(rio_t *rio, char *servername, char *port, char *filename);	
 int forward_response(int client_fd, int server_fd);
+void *thread(int client_fd);
 
 int main(int argc, char *argv[])
 {
@@ -19,6 +20,7 @@ int main(int argc, char *argv[])
 	char hostname[MAXLINE], port[MAXLINE];
 	socklen_t client_len;
 	struct sockaddr_storage client_addr;	
+	pthread_t tid;
 
 	if (argc != 2){
 		fprintf(stderr, "usage: %s <port>\n", argv[0]);
@@ -32,8 +34,9 @@ int main(int argc, char *argv[])
 		client_fd = Accept(listen_fd, (SA *)&client_addr, &client_len);
 		Getnameinfo( (SA *)&client_addr, client_len, hostname, MAXLINE, port, MAXLINE, 0);
 		printf("Accepted connection from (%s, %s)\n", hostname, port);
-		doit(client_fd);
-		Close(client_fd);
+		//doit(client_fd);
+		//Close(client_fd);
+		Pthread_create(&tid, NULL, thread, client_fd);
 	}	
     return 0;
 }
@@ -188,4 +191,12 @@ int forward_response(int client_fd, int server_fd)
 		//printf("\n forwarding %d bytes to client\n", num);
 	}	
 	return 0;
+}
+
+void *thread(int client_fd)
+{
+	Pthread_detach(Pthread_self());
+	doit(client_fd);
+	Close(client_fd);
+	return NULL;
 }
