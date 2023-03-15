@@ -5,14 +5,40 @@
 #define MAX_CACHE_SIZE 1049000
 #define MAX_OBJECT_SIZE 102400
 
+typedef struct cache_node{
+	char url[MAXLINE];
+	char cache[MAX_OBJECT_SIZE];
+	int object_size;
+	struct cache_node *nextp;
+}cnode;
 /* You won't lose style points for including this long line in your code */
 static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
+cnode *cache_entry = NULL;
+int cache_size = 0;
+int readcnt = 0;
+sem_t mutex, w;
+
 void doit(int fd);
 void client_error(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg);
 int parse_url(char *url, char *port, char *servername, char *filename);
 int forward_request(rio_t *rio, char *servername, char *port, char *filename);	
-int forward_response(int client_fd, int server_fd);
+int forward_response(int client_fd, int server_fd, char *url);
 void *thread(int client_fd);
+
+void init_cnode(cnode *node, char *url);
+void insert_cnode(cnode *node);
+cnode *remove_cnode(cnode *node);
+void excile_tail();
+
+cnode *search_cache(char *url);
+int forward_cache(int client_fd, cnode *object_cache);
+cnode* in_cache(char *url);
+int set_first(cnode *node);
+void copy_to_cache(cnode *node, char *buf, int num);
+void add_or_drop(cnode *node);
+
+void check_cache();
+
 
 int main(int argc, char *argv[])
 {
@@ -27,6 +53,9 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 	
+	
+	Sem_init(&mutex, 0, 1);
+	Sem_init(&w, 0, 1);
 	listen_fd = Open_listenfd(argv[1]);
 	while(1)
 	{
@@ -46,17 +75,25 @@ void doit(int client_fd)
 	char buf[MAXLINE], method[MAXLINE], url[MAXLINE], version[MAXLINE];
 	char filename[MAXLINE], servername[MAXLINE], port[6];
 	int server_fd;
+	cnode *object_cache;
 	
 	rio_t client_rio;
 	
 	Rio_readinitb(&client_rio, client_fd);
 	Rio_readlineb(&client_rio, buf, MAXLINE);
 
-	//printf("%s", buf);
 	sscanf(buf, "%s %s %s", method, url, version);
 	if (strcasecmp(method, "GET"))
 	{
 		client_error(client_fd, method, "501", "Not implemented", "The proxy does not implement the method");
+		return;
+	}
+
+	object_cache = in_cache(url);
+	if ( object_cache )
+	{
+		forward_cache(client_fd, object_cache);
+		set_first(object_cache);	
 		return;
 	}
 	
@@ -67,15 +104,15 @@ void doit(int client_fd)
 	}
 	
 	server_fd = forward_request(&client_rio, servername, port, filename);	
-	//printf("\nhas forwarded the request\m");
+
 	if ( server_fd == -1)
 	{
 		client_error(client_fd, method, "400", "Bad Request", "The proxy can't access the server");
 		return;
 	}
-	forward_response( client_fd, server_fd);
-	//printf("\nhas forwarded the response\m");
+	forward_response( client_fd, server_fd, url);
 	Close(server_fd);
+	//check_cache();
 	
 }
 
@@ -155,9 +192,7 @@ int forward_request(rio_t *read_rio, char *servername, char* port, char *filenam
 
 	while(1)
 	{
-		//printf("\n looping in forward_request \n");
 		Rio_readlineb(read_rio, buf, MAXLINE);
-		//printf("%s", buf);
 		if ( (!strstr(buf, "Host:")) && (!strstr(buf, "User-Agent:")) 
 			&& (!strstr(buf, "Connection:")) && (!strstr(buf, "Proxy-Connection:")) )
 		{
@@ -165,31 +200,35 @@ int forward_request(rio_t *read_rio, char *servername, char* port, char *filenam
 		}
 		if ( strcmp(buf, "\r\n") == 0)
 		{
-			//printf("it should stop now");
 			break;
 		}
 	}	
-	//printf("ready to return");
 	return server_fd;
 }
 
 
 
-int forward_response(int client_fd, int server_fd)
+int forward_response(int client_fd, int server_fd, char *url)
 {
 	char buf[MAXLINE];
 	rio_t server_rio;
 	int num;
 	
+	cnode *object_cache = Malloc(sizeof(cnode));
+	init_cnode(object_cache, url);
+	
 	Rio_readinitb(&server_rio, server_fd);
 
 	while(1)
 	{
+		printf("looping, in forward_response\n");
 		if ((num = Rio_readnb(&server_rio, buf, MAXLINE)) == 0)
 			break;
+		copy_to_cache(object_cache, buf, num);
 		Rio_writen(client_fd, buf, num);	
-		//printf("\n forwarding %d bytes to client\n", num);
 	}	
+	printf("loop ends, in forward_response\n");
+	add_or_drop(object_cache);
 	return 0;
 }
 
@@ -199,4 +238,187 @@ void *thread(int client_fd)
 	doit(client_fd);
 	Close(client_fd);
 	return NULL;
+}
+
+
+void insert_cnode(cnode *node)
+{
+	if ( cache_entry == NULL )
+	{
+		cache_entry = node;
+		node->nextp = NULL;
+		cache_size = cache_size + node->object_size;
+		return ;
+	}
+	cnode *origin_first = cache_entry;
+	cache_entry = node;
+	node->nextp = origin_first;
+	cache_size = cache_size + node->object_size;
+
+	while(cache_size > MAX_CACHE_SIZE )
+	{
+		excile_tail();
+	}
+	return ;
+}
+
+cnode *remove_cnode(cnode *node)
+{
+	cnode *nodep, *prevp;
+	prevp = cache_entry;
+	nodep = prevp->nextp;
+	
+	while ( nodep )
+	{
+		if ( node == nodep)
+		{
+			prevp->nextp = nodep->nextp;
+			nodep->nextp = NULL;
+			cache_size = cache_size - nodep->object_size;
+			break;	
+		}
+		nodep = nodep->nextp;
+		prevp = prevp->nextp;
+	}
+	return nodep;
+}
+
+void excile_tail()
+{
+	cnode *nodep, *prevp;
+	prevp = cache_entry;
+	if (prevp == NULL)
+		return;
+	nodep = prevp->nextp;
+	while ( nodep->nextp )
+	{
+		nodep = nodep->nextp;
+		prevp = prevp->nextp;
+	}
+	cache_size = cache_size - nodep->object_size;
+	Free(nodep);
+	prevp->nextp = NULL;
+}
+
+cnode *search_cache(char *url)
+{
+	cnode *nodep;
+	nodep = cache_entry;
+	while ( nodep )
+	{
+		if ( !strcmp(url, nodep->url) )
+			break;
+		nodep = nodep->nextp;
+	}
+	return nodep;
+}
+
+
+
+void init_cnode(cnode *node, char *url)
+{
+	strcpy(node->url, url);
+	node->object_size = 0;
+	node->nextp = NULL;
+	return;	
+}
+
+
+
+cnode *in_cache(char *url)
+{
+	cnode *node;
+
+	P(&mutex);
+	readcnt++;
+	if (readcnt == 1)
+		P(&w);
+	V(&mutex);
+
+	node = search_cache(url);
+
+	P(&mutex);
+	readcnt--;
+	if (readcnt == 0)
+		V(&w);
+	V(&mutex);
+
+	return node;
+}
+
+int forward_cache(int client_fd, cnode *object_cache)
+{
+	P(&mutex);
+	readcnt++;
+	if (readcnt == 1)
+		P(&w);
+	V(&mutex);
+
+	Rio_writen(client_fd, object_cache->cache, object_cache->object_size);
+
+	P(&mutex);
+	readcnt--;
+	if (readcnt == 0)
+		V(&w);
+	V(&mutex);	
+	return 0;
+}
+
+int set_first(cnode *node)
+{
+	P(&w);
+	remove_cnode(node);
+	insert_cnode(node);
+	V(&w);
+	return 0;
+}
+
+void copy_to_cache(cnode *node, char *buf, int num)
+{
+	if ( node->object_size + num <= MAX_OBJECT_SIZE)
+	{
+		char *ptr = node->cache + node->object_size;
+		memcpy(ptr, buf, num);
+	}
+	node->object_size += num;
+	return ;
+}
+
+void add_or_drop(cnode *node)
+{
+	if ( node->object_size < MAX_OBJECT_SIZE)
+	{
+		P(&w);
+		insert_cnode(node);
+		V(&w);
+		return;
+	}
+	Free(node);
+	return;
+}
+
+void check_cache()
+{
+	P(&mutex);
+	readcnt++;
+	if (readcnt == 1)
+		P(&w);
+	V(&mutex);
+
+	cnode *p;
+	p = cache_entry;
+	int index = 1;
+	while(p)
+	{
+		printf("No.%d, size:%d, url:%s\n", index++, p->object_size, p->url);
+		p = p->nextp;
+	}
+	if ( index == 1)
+		printf("no cache\n");
+	
+	P(&mutex);
+	readcnt--;
+	if (readcnt == 0)
+		V(&w);
+	V(&mutex);
 }
